@@ -1,0 +1,121 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pcap.h>
+#include <netinet/if_ether.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <netinet/udp.h>
+#include <net/ethernet.h>
+
+typedef unsigned char u_char;
+
+int pcap_parser(const struct pcap_pkthdr *header, const u_char *packet, u_char **out_buffer, int *out_len);
+
+int main(int argc, char *argv[]){
+    if (argc < 2){
+        fprintf(stderr, "Usage: %s <pcap_file>\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_t *handle = pcap_open_offline(argv[1], errbuf);
+    if (!handle) {
+        fprintf(stderr, "Error opening file %s: %s\n", argv[1], errbuf);
+        return EXIT_FAILURE;
+    }
+    
+    pcap_dumper_t *dumper = pcap_dump_open(handle, "output_headers_only.pcap");
+    if (!dumper) {
+        fprintf(stderr, "Failed to open dumper file: %s\n", "output_headers_only.pcap");
+        pcap_close(handle);
+        return EXIT_FAILURE;
+    }
+
+    const u_char *packet;
+    struct pcap_pkthdr *header;
+    int result;
+    while ((result = pcap_next_ex(handle, &header, &packet)) >= 0) {
+        if (result == 0) continue; //Timeout, in offline connection, shouldn't happen
+        u_char *trimmed = NULL;
+        int trimmed_len = 0;
+
+        int ok = pcap_parser(header, packet, &trimmed, &trimmed_len);
+        if (ok == 1) {
+            struct pcap_pkthdr new_hdr = *header;
+            new_hdr.caplen = trimmed_len;
+            new_hdr.len = trimmed_len;
+
+            pcap_dump((u_char *)dumper, &new_hdr, trimmed);
+            free(trimmed);
+        }
+    }
+    if (result == -1) {
+        fprintf(stderr, "Error reading the pcap file: %s\n", pcap_geterr(handle));
+    }    
+    pcap_close(handle);
+    return EXIT_SUCCESS;
+}
+int pcap_parser(const struct pcap_pkthdr *header, const u_char *packet, u_char **out_buffer, int *out_len){
+    if (!header || !packet || !out_buffer || !out_len) {
+        return -1;
+    }
+    if (header->caplen < sizeof(struct ether_header)) {
+        return 0;
+    }
+    //Cast ether_header into first 14 bytes of raw packet data
+    const struct ether_header *eth_header = (const struct ether_header *)packet;
+    uint16_t ether_type = ntohs(eth_header->ether_type);
+
+    int ip_offset = sizeof(struct ether_header);
+    //check if ethertype is VLAN
+    if (ether_type == ETHERTYPE_VLAN) {
+        if (header->caplen < ip_offset + 4 + sizeof(struct iphdr)) return 0;
+        ether_type = ntohs(*(uint16_t *)(packet + ip_offset + 2));
+        ip_offset += 4;  // VLAN tag, extra 4 bytes
+    }
+
+    if (ether_type != ETHERTYPE_IP) {
+        return 0;
+    }
+    if (header->caplen < ip_offset + sizeof(struct iphdr)) return 0;
+    const struct iphdr *ip_hdr = (const struct iphdr *)(packet + ip_offset);
+    int ip_header_len = ip_hdr->ihl * 4;
+
+    if (header->caplen < ip_offset + ip_header_len) return 0;
+
+    const u_char *l4_ptr = packet + ip_offset + ip_header_len;
+    int l4_len = 0;
+
+    if (ip_hdr->protocol == IPPROTO_TCP) {
+        if (header->caplen < l4_ptr - packet + sizeof(struct tcphdr)) return 0;
+        const struct tcphdr *tcp_hdr = (const struct tcphdr *)l4_ptr;
+        l4_len = tcp_hdr->doff * 4;
+    }
+    else if (ip_hdr->protocol == IPPROTO_UDP) {
+        if (header->caplen < l4_ptr - packet + sizeof(struct udphdr)) return 0;
+        const struct udphdr *udp_hdr = (const struct udphdr *)l4_ptr;
+        l4_len = sizeof(struct udphdr);
+    }
+    else {
+        return 0; 
+    }
+    
+    int total_len = ip_offset + ip_header_len + l4_len;
+    if (header->caplen < total_len) return 0;
+
+    *out_buffer = (u_char *)malloc(total_len);
+    if (!*out_buffer) return -1;
+
+    memcpy(*out_buffer, packet, total_len);
+    *out_len = total_len;
+
+    struct iphdr *out_ip_hdr = (struct iphdr *)(*out_buffer + ip_offset);
+    out_ip_hdr->tot_len = htons(ip_header_len + l4_len);
+
+    if (ip_hdr->protocol == IPPROTO_UDP) {
+        struct udphdr *out_udp_hdr = (struct udphdr *)(*out_buffer + ip_offset + ip_header_len);
+        out_udp_hdr->len = htons(sizeof(struct udphdr));
+    }
+    
+    return 1;
+}
