@@ -11,7 +11,7 @@
 
 typedef unsigned char u_char;
 
-#define MAX_PACKETS 1000
+#define MAX_PACKETS 50000
 #define IP_ENDING_SIZE 65536
 void packet_handler(u_char *user, const struct pcap_pkthdr *header, const u_char *packet);
 int pcap_parser(const struct pcap_pkthdr *header, const u_char *packet, u_char **out_buffer, int *out_len, uint16_t *mapping);
@@ -20,23 +20,26 @@ void anonymize_ip(struct iphdr *iphdr, uint16_t *mapping);
 
 typedef struct {
     uint16_t *mapping;
-    pcap_dumper_t *dumper;
+   // pcap_dumper_t *dumper;
 } handler_ctx;
 
 int main(int argc, char *argv[]){
-    // if (argc < 2){
-    //     fprintf(stderr, "Usage: %s <pcap_file>\n", argv[0]);
-    //     return EXIT_FAILURE;
-    // }
-    // char errbuf[PCAP_ERRBUF_SIZE];
-    // pcap_t *handle = pcap_open_live(argv[1], BUFSIZ, 1, 1000, errbuf);
-    //     if (!handle) {
-    //     fprintf(stderr, "Error opening file %s: %s\n", argv[1], errbuf);
-    //     return EXIT_FAILURE;
-    // }
-    // struct bpf_program fp;
-    // pcap_compile(handle, &fp, "ip", 0, PCAP_NETMASK_UNKNOWN);
-    // pcap_setfilter(handle, &fp);
+    if (argc < 2){
+        fprintf(stderr, "Usage: %s <pcap_file>\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_t *handle = pcap_open_live(argv[1], BUFSIZ, 1, 1000, errbuf);
+        if (!handle) {
+        fprintf(stderr, "Error opening file %s: %s\n", argv[1], errbuf);
+        return EXIT_FAILURE;
+    }
+    struct bpf_program fp;
+    if (pcap_compile(handle, &fp, "ip", 0, PCAP_NETMASK_UNKNOWN) == -1 || pcap_setfilter(handle, &fp) == -1) {
+        fprintf(stderr, "Failed to set filter: %s\n", pcap_geterr(handle));
+        pcap_close(handle);
+        return EXIT_FAILURE;
+    }
 
     // pcap_dumper_t *dumper = pcap_dump_open(handle, "output_headers_anonymized.pcap");
     // if (!dumper) {
@@ -47,31 +50,35 @@ int main(int argc, char *argv[]){
     uint16_t mapping[IP_ENDING_SIZE];
     init_map(mapping);
 
-    // handler_ctx ctx = { .mapping = mapping, .dumper = dumper };
+    handler_ctx ctx = { .mapping = mapping, /*.dumper = dumper */};
     
-    // pcap_loop(handle, MAX_PACKETS, packet_handler, (u_char *)&ctx);
+    if (pcap_loop(handle, MAX_PACKETS, packet_handler, (u_char *)&ctx) == -1) {
+        fprintf(stderr, "Error during pcap loop: %s\n", pcap_geterr(handle));
+        pcap_close(handle);
+        return EXIT_FAILURE;    
+    }
     // pcap_dump_close(dumper);
-    // pcap_close(handle);
-    // return EXIT_SUCCESS;
+    pcap_close(handle);
+    return EXIT_SUCCESS;
 }
 void packet_handler(u_char *user, const struct pcap_pkthdr *header, const u_char *packet) {
-    handler_ctx *ctx = (handler_ctx *)user;
+    // handler_ctx *ctx = (handler_ctx *)user;
 
-    if (header->caplen > header->len || header->caplen < 42) {
-        fprintf(stderr, "Skipping malformed/truncated packet (caplen = %u, len = %u)\n", header->caplen, header->len);
-        return;
-    }
+    // if (header->caplen > header->len || header->caplen < 42) {
+    //     fprintf(stderr, "Skipping malformed/truncated packet (caplen = %u, len = %u)\n", header->caplen, header->len);
+    //     return;
+    // }
 
-    u_char *trimmed = NULL;
-    int trimmed_len = 0;
+    // u_char *trimmed = NULL;
+    // int trimmed_len = 0;
 
-    if (pcap_parser(header, packet, &trimmed, &trimmed_len, ctx->mapping) == 1) {
-        struct pcap_pkthdr new_hdr = *header;
-        new_hdr.caplen = trimmed_len;
-        new_hdr.len = trimmed_len;
-        pcap_dump((u_char *)ctx->dumper, &new_hdr, trimmed);
-        free(trimmed);
-    }
+    // if (pcap_parser(header, packet, &trimmed, &trimmed_len, ctx->mapping) == 1) {
+    //     struct pcap_pkthdr new_hdr = *header;
+    //     new_hdr.caplen = trimmed_len;
+    //     new_hdr.len = trimmed_len;
+    //     pcap_dump((u_char *)ctx->dumper, &new_hdr, trimmed);
+    //     free(trimmed);
+    // }
 }
 int pcap_parser(const struct pcap_pkthdr *header, const u_char *packet, u_char **out_buffer, int *out_len, uint16_t *mapping){
     if (!header || !packet || !out_buffer || !out_len) {
@@ -103,12 +110,13 @@ int pcap_parser(const struct pcap_pkthdr *header, const u_char *packet, u_char *
 
     const u_char *l4_ptr = packet + ip_offset + ip_header_len;
     int l4_len = 0;
-
+    //Check if TCP
     if (ip_hdr->protocol == IPPROTO_TCP) {
         if (header->caplen < l4_ptr - packet + sizeof(struct tcphdr)) return 0;
         const struct tcphdr *tcp_hdr = (const struct tcphdr *)l4_ptr;
         l4_len = tcp_hdr->doff * 4;
     }
+    //UDP
     else if (ip_hdr->protocol == IPPROTO_UDP) {
         if (header->caplen < l4_ptr - packet + sizeof(struct udphdr)) return 0;
         const struct udphdr *udp_hdr = (const struct udphdr *)l4_ptr;
@@ -117,7 +125,7 @@ int pcap_parser(const struct pcap_pkthdr *header, const u_char *packet, u_char *
     else {
         return 0; 
     }
-    
+    //Add up total length
     int total_len = ip_offset + ip_header_len + l4_len;
     if (header->caplen < total_len) return 0;
 
@@ -126,7 +134,7 @@ int pcap_parser(const struct pcap_pkthdr *header, const u_char *packet, u_char *
 
     memcpy(*out_buffer, packet, total_len);
     *out_len = total_len;
-
+    //Update the actual ip_hdr contents in the packet
     struct iphdr *out_ip_hdr = (struct iphdr *)(*out_buffer + ip_offset);
     out_ip_hdr->tot_len = htons(ip_header_len + l4_len);
     anonymize_ip(out_ip_hdr, mapping);
